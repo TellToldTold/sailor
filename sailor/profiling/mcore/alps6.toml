@@ -1,0 +1,18 @@
+# EDF: alps6 NGC PyTorch 26.02
+
+image = "ghcr.io/eth-cscs/alps-extended-images/apertus-1p5-cuda:alps6"
+
+mounts = [
+  "${HOME}",
+  "/capstor",
+  "/iopsstor",
+]
+
+writable = true
+entrypoint = true
+
+[env]
+PMIX_MCA_psec = "native"
+
+[annotations]
+com.hooks.cxi.enabled = "false"

@@ -143,3 +143,16 @@ bash generate.sh
 ```
 
 Adapt the name of the baseline, GPU type, and number of GPUs per machine accordingly in the file.
+
+## 3. Model profiling with Megatron-Core (Alps)
+
+`sailor/profiling/mcore/` profiles with the Megatron-Core copy in `third_party/Megatron-LM` (upstream `e429478`)
+instead of Megatron-DeepSpeed, and writes the same `profile_<model>_<gpu>_<tmp>_<mbs>.json` files, so step 2
+(`gather_profs.py`) and the planner are unchanged. Models: `LLAMA-3-8`, `QWEN3-30B-A3B` (EP = ETP = 1), defined in
+`profile_sweep.py`. Sequence parallelism is on when TP > 1. On Clariden, from `sailor/profiling/mcore`:
+
+```bash
+sbatch profile_sweep.slurm LLAMA-3-8        # TP 1/2/4 x MBS 1/2/4/8 on one node -> $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/
+```
+
+Method and output keys: docstring of `profile_mcore.py`.
