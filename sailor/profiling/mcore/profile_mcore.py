@@ -179,7 +179,7 @@ def main():
     sailor, megatron_argv = parser.parse_known_args()
 
     sys.path.insert(0, str(MEGATRON))
-    import megatron
+    import megatron.core
     import megatron.core.pipeline_parallel.schedules as schedules
     import megatron.training.training as training
     from megatron.core import parallel_state
@@ -215,7 +215,7 @@ def main():
         return out
 
     if os.environ.get("RANK", "0") == "0":
-        print(f"[sailor-profile] megatron from {Path(megatron.__file__).parent}", flush=True)
+        print(f"[sailor-profile] megatron from {Path(megatron.core.__file__).parent}", flush=True)
     training.setup_model_and_optimizer = setup_with_hooks
     training.train = train_then_write
 
