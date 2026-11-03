@@ -59,7 +59,7 @@ class LayerProfiler:
         self.cur = None
 
         gpt_model.register_forward_pre_hook(self.on_model_start)
-        gpt_model.embedding.register_forward_pre_hook(self.on_emb_input)
+        gpt_model.embedding.register_forward_pre_hook(self.on_emb_input, with_kwargs=True)
         gpt_model.embedding.register_forward_hook(self.boundary("emb"))
         for i, layer in enumerate(self.layers, 1):
             layer.register_forward_hook(self.boundary(f"L{i}"))
@@ -87,8 +87,9 @@ class LayerProfiler:
         self.record("f_start")
         self.mem["start"] = torch.cuda.memory_allocated()
 
-    def on_emb_input(self, module, args):
-        self.act["emb"] = [numel_bytes(args), None]
+    def on_emb_input(self, module, args, kwargs):
+        # GPTModel passes input_ids and position_ids as keywords
+        self.act["emb"] = [numel_bytes(list(args) + list(kwargs.values())), None]
 
     def boundary(self, segment):
         def hook(module, args, output):
