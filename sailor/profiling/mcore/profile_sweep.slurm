@@ -22,9 +22,8 @@ export MODEL="$1"; shift
 export OUT="${SCRATCH}/sailor-profiles/${MODEL}/${SLURM_JOB_ID}" EXTRA="$*"
 echo "job ${SLURM_JOB_ID} on $(hostname) git=$(git rev-parse --short HEAD)$(git diff --quiet HEAD || echo -dirty) -> ${OUT}"
 
-# same environment knobs as our Alps training runs (moe-comms docs/status.md)
 srun --environment="$(realpath alps6.toml)" bash -c '
   cd "${SLURM_SUBMIT_DIR}"
-  export NVTE_USE_CUTLASS_GROUPED_GEMM=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   python profile_sweep.py --model "${MODEL}" --gpu-type GH-96 --results-dir "${OUT}" ${EXTRA}
 '
