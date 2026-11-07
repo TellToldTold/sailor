@@ -46,18 +46,21 @@ class LayerProfiler:
     def __init__(self, gpt_model, optimizer):
         self.layers = list(gpt_model.decoder.layers)
         self.norm = gpt_model.decoder.final_layernorm
+        self.segments = ["emb"] + [f"L{i}" for i in range(1, len(self.layers) + 1)] + ["norm", "head"]
+
         assert len(self.layers) == 2, "profile with --num-layers 2"
-        assert self.norm is not None, "final norm missing (PP > 1?)"
-        n = len(self.layers)
-        self.segments = ["emb"] + [f"L{i}" for i in range(1, n + 1)] + ["norm", "head"]
+        assert self.norm is not None, "final norm missing"
+
         modules = {"emb": gpt_model.embedding, "norm": self.norm, "head": gpt_model.output_layer}
         modules.update({f"L{i}": layer for i, layer in enumerate(self.layers, 1)})
+        
         self.params = {s: numel_bytes(list(m.parameters())) for s, m in modules.items()}
-        self.iters = []  # per iteration: {event name: torch.cuda.Event}
-        self.mem = {}  # forward boundary -> torch.cuda.memory_allocated() (last iteration)
-        self.act = {}  # segment -> [(input numel, bytes), (output numel, bytes)] (last iteration)
+        self.iters = []  # per iteration: {event name: torch.cuda.Event}, contains the times of each step for each iteration
+        self.mem = {}  # torch.cuda.memory_allocated() at each forward boundary for the last iteration only
+        self.act = {}  # per segment: [(input numel, bytes), (output numel, bytes)], tensor sizes at each segment's input and output
         self.cur = None
 
+        # Add forward hooks for all layers, embed and norm
         gpt_model.register_forward_pre_hook(self.on_model_start)
         gpt_model.embedding.register_forward_pre_hook(self.on_emb_input, with_kwargs=True)
         gpt_model.embedding.register_forward_hook(self.boundary("emb"))
@@ -66,6 +69,7 @@ class LayerProfiler:
         self.norm.register_forward_hook(self.boundary("norm"))
         gpt_model.register_forward_hook(self.on_model_end)
 
+        # Add forward events for the optimizer steps
         step = optimizer.step
 
         def timed_step(*args, **kwargs):
@@ -99,6 +103,7 @@ class LayerProfiler:
             self.act.setdefault(segment, [None, None])[1] = numel_bytes([out])
             nxt = self.segments[self.segments.index(segment) + 1]
             self.act[nxt] = [numel_bytes([out]), None]
+            # add backward hook for the backward layer of this forward layer
             if out.requires_grad:
                 out.register_hook(lambda grad: self.record(f"b_{segment}"))
 
@@ -151,8 +156,9 @@ class LayerProfiler:
         act_mem = self.mem[end] - self.mem[prev]
         (in_n, in_b), (out_n, out_b) = self.act[segment]
         p_n, p_b = self.params[segment]
+        # "floats" are elements of the training dtype: the planner multiplies by float_size (2 for bf16)
         return {
-            "params_floats": p_n, "act_output_floats": out_n, "act_input_floats": in_n, "act_mem_floats": act_mem // 4,
+            "params_floats": p_n, "act_output_floats": out_n, "act_input_floats": in_n, "act_mem_floats": act_mem // 2,
             "params_bytes": p_b, "act_output_bytes": out_b, "act_input_bytes": in_b, "act_mem_bytes": act_mem,
         }
 
@@ -165,8 +171,10 @@ class LayerProfiler:
         memory = {str(k): self.mem_info(s) for k, s in sorted(source.items())}
         covered = sum(fwd.values()) + sum(bwd.values()) + opt
         share = f" ({100 * covered / iteration:.1f}% of the iteration)" if iteration else ""
+
         summary = (f"[sailor-profile] fwd {fwd}\n[sailor-profile] bwd {bwd}\n[sailor-profile] update {opt} s, "
                    f"iteration {iteration} s, fwd+bwd+update {covered:.6f} s{share}")
+        
         return {"timing": timing, "memory": memory}, summary
 
 
@@ -179,44 +187,47 @@ def main():
     parser.add_argument("--sailor-skip-iters", type=int, default=5)
     sailor, megatron_argv = parser.parse_known_args()
 
+    # import Megatron from third_party/Megatron-LM, not from the container
     sys.path.insert(0, str(MEGATRON))
     import megatron.core
     import megatron.core.pipeline_parallel.schedules as schedules
     import megatron.training.training as training
-    from megatron.core import parallel_state
-    from megatron.core.num_microbatches_calculator import get_num_microbatches
     from megatron.core.utils import unwrap_model
     from megatron.training import get_args
 
     state = {}
-    setup_model_and_optimizer, train, backward_step = (
-        training.setup_model_and_optimizer, training.train, schedules.backward_step)
+    setup_model_and_optimizer, train, backward_step = (training.setup_model_and_optimizer, training.train, schedules.backward_step)
 
     def setup_with_hooks(*args, **kwargs):
         model, optimizer, scheduler = setup_model_and_optimizer(*args, **kwargs)
-        assert len(model) == 1 and parallel_state.get_pipeline_model_parallel_world_size() == 1, "needs PP = 1"
-        assert get_num_microbatches() == 1, "needs one micro-batch per iteration (GBS = MBS x DP)"
-        assert get_args().recompute_granularity is None, "activation recomputation changes the backward"
+        
         state["prof"] = LayerProfiler(unwrap_model(model[0]), optimizer)
+
+        # Add events for full backward pass boundaries
         schedules.backward_step = state["prof"].wrap_backward_step(backward_step)
         return model, optimizer, scheduler
 
     def train_then_write(*args, **kwargs):
         out = train(*args, **kwargs)
         res, summary = state["prof"].result(sailor.sailor_num_layers_original, sailor.sailor_skip_iters)
+        
         if torch.distributed.get_rank() == 0:
             print(summary, flush=True)
+
             margs = get_args()
             Path(sailor.sailor_results_dir).mkdir(parents=True, exist_ok=True)
             path = Path(sailor.sailor_results_dir) / (
                 f"profile_{sailor.sailor_model_name}_{sailor.sailor_gpu_type}_"
                 f"{margs.tensor_model_parallel_size}_{margs.micro_batch_size}.json")
+            
             path.write_text(json.dumps(res, indent=2))
             print(f"[sailor-profile] wrote {path}", flush=True)
+        
         return out
 
     if os.environ.get("RANK", "0") == "0":
         print(f"[sailor-profile] megatron from {Path(megatron.core.__file__).parent}", flush=True)
+    
     training.setup_model_and_optimizer = setup_with_hooks
     training.train = train_then_write
 
