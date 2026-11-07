@@ -11,7 +11,9 @@ which sailor/profiling/gather_profs.py turns into the planner's inputs.
 Layer keys (as in the Megatron-DeepSpeed LLAMA profiles): "0" embedding, "1".."N" transformer layers, "N+1" final
 norm, "N+2" output layer + loss. "timing": [fwd, bwd, update] in seconds, where update is the optimizer step of
 the whole profiled model, repeated for every key (the planner takes the max over a stage). "memory": parameters,
-input/output activation sizes and the memory allocated during the layer's forward, as before.
+input/output activation sizes and the memory allocated during the layer's forward, as before. "gpu_memory"
+(not read by gather_profs.py): whole-GPU bytes on rank 0 after setup and at the end (non-PyTorch overhead), and
+peaks over the measured iterations, to set and check the simulator's megatron_mem.
 
 The model is profiled with 2 transformer layers: key "1" from the first, keys "2".."N" from the second.
 Forward: CUDA events at module boundaries (forward hooks). Backward: gradient hooks on the same boundary tensors,
@@ -28,7 +30,27 @@ from pathlib import Path
 
 import torch
 
+# our copy of Megatron must come first on the path, before any megatron import
 MEGATRON = Path(__file__).resolve().parents[3] / "third_party" / "Megatron-LM"
+sys.path.insert(0, str(MEGATRON))
+
+import megatron.core  # noqa: E402
+import megatron.core.pipeline_parallel.schedules as schedules  # noqa: E402
+import megatron.training.training as training  # noqa: E402
+from megatron.core import parallel_state  # noqa: E402,F401
+from megatron.core.num_microbatches_calculator import get_num_microbatches  # noqa: E402,F401
+from megatron.core.utils import unwrap_model  # noqa: E402
+from megatron.training import get_args  # noqa: E402
+
+
+def gpu_memory_now():
+    """Bytes: PyTorch allocated / reserved, device-wide used (total - free, as nvidia-smi / NVML), and the
+    non-PyTorch part (used - reserved: CUDA context, NCCL buffers, library workspaces)."""
+    torch.cuda.synchronize()
+    free, total = torch.cuda.mem_get_info()
+    allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+    return {"allocated": allocated, "reserved": reserved, "device_used": total - free,
+            "non_torch": total - free - reserved}
 
 
 def numel_bytes(tensors):
@@ -43,7 +65,9 @@ def first_tensor(output):
 class LayerProfiler:
     """Segments, in forward order: emb, L1..Ln, norm, head (output layer + loss)."""
 
-    def __init__(self, gpt_model, optimizer):
+    def __init__(self, gpt_model, optimizer, skip):
+        self.skip = skip
+        self.gpu_mem = {"after_setup": gpu_memory_now()}  # model and optimizer built, before training
         self.layers = list(gpt_model.decoder.layers)
         self.norm = gpt_model.decoder.final_layernorm
         self.segments = ["emb"] + [f"L{i}" for i in range(1, len(self.layers) + 1)] + ["norm", "head"]
@@ -86,6 +110,8 @@ class LayerProfiler:
         self.cur[name] = event
 
     def on_model_start(self, module, args):
+        if len(self.iters) == self.skip:  # first measured iteration: peaks from here on
+            torch.cuda.reset_peak_memory_stats()
         self.cur = {}
         self.iters.append(self.cur)
         self.record("f_start")
@@ -172,10 +198,24 @@ class LayerProfiler:
         covered = sum(fwd.values()) + sum(bwd.values()) + opt
         share = f" ({100 * covered / iteration:.1f}% of the iteration)" if iteration else ""
 
+        # whole GPU, this rank: after setup, at the end (after warm-up), and peaks over the measured iterations.
+        # The peak device use is an estimate: the non-PyTorch part at the end + PyTorch's peak reserved.
+        end = gpu_memory_now()
+        gpu = dict(self.gpu_mem, end=end, total=torch.cuda.mem_get_info()[1],
+                   peak_allocated=torch.cuda.max_memory_allocated(), peak_reserved=torch.cuda.max_memory_reserved())
+        gpu["peak_device_used_est"] = end["non_torch"] + gpu["peak_reserved"]
+
+        def gb(b):
+            return f"{b / 1e9:.2f}"
+
         summary = (f"[sailor-profile] fwd {fwd}\n[sailor-profile] bwd {bwd}\n[sailor-profile] update {opt} s, "
-                   f"iteration {iteration} s, fwd+bwd+update {covered:.6f} s{share}")
-        
-        return {"timing": timing, "memory": memory}, summary
+                   f"iteration {iteration} s, fwd+bwd+update {covered:.6f} s{share}\n"
+                   f"[sailor-profile] GB: non-torch {gb(gpu['after_setup']['non_torch'])} after setup, "
+                   f"{gb(end['non_torch'])} at end; peak allocated {gb(gpu['peak_allocated'])}, "
+                   f"peak reserved {gb(gpu['peak_reserved'])}, peak device used (est.) "
+                   f"{gb(gpu['peak_device_used_est'])} of {gb(gpu['total'])}")
+
+        return {"timing": timing, "memory": memory, "gpu_memory": gpu}, summary
 
 
 def main():
@@ -187,21 +227,13 @@ def main():
     parser.add_argument("--sailor-skip-iters", type=int, default=5)
     sailor, megatron_argv = parser.parse_known_args()
 
-    # import Megatron from third_party/Megatron-LM, not from the container
-    sys.path.insert(0, str(MEGATRON))
-    import megatron.core
-    import megatron.core.pipeline_parallel.schedules as schedules
-    import megatron.training.training as training
-    from megatron.core.utils import unwrap_model
-    from megatron.training import get_args
-
     state = {}
     setup_model_and_optimizer, train, backward_step = (training.setup_model_and_optimizer, training.train, schedules.backward_step)
 
     def setup_with_hooks(*args, **kwargs):
         model, optimizer, scheduler = setup_model_and_optimizer(*args, **kwargs)
         
-        state["prof"] = LayerProfiler(unwrap_model(model[0]), optimizer)
+        state["prof"] = LayerProfiler(unwrap_model(model[0]), optimizer, sailor.sailor_skip_iters)
 
         # Add events for full backward pass boundaries
         schedules.backward_step = state["prof"].wrap_backward_step(backward_step)
