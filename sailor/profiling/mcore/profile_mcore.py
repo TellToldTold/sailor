@@ -15,6 +15,15 @@ input/output activation sizes and the memory allocated during the layer's forwar
 (not read by gather_profs.py): whole-GPU bytes on rank 0 after setup and at the end (non-PyTorch overhead), and
 peaks over the measured iterations, to set and check the simulator's megatron_mem.
 
+Also not read by gather_profs.py (docs/moe_iteration_time_model.md):
+- "layer_parts": {part: [fwd, bwd]} in seconds, the second transformer layer (keys "2".."N") split into parts.
+  Dense: "attn" (layer input to MLP input) and "mlp" (MLP and residual add; with TE the pre-MLP norm is fused into
+  the MLP's first GEMM). MoE: "attn" (with the pre-MLP norm), "router_permute", "dispatch" (A2A), "sort_in"
+  (regroup by local expert), "experts" (grouped GEMMs), "sort_out", "combine" (A2A), "unpermute" (with the
+  residual add). Event at each part's output in the forward, gradient hook on the same tensor in the backward.
+- "optimizer": {"elements", "expert_elements"}: parameters on this GPU, all updated by its optimizer step
+  (no --use-distributed-optimizer: ZeRO-0), to fit the step time as rate x elements + constant.
+
 The model is profiled with 2 transformer layers: key "1" from the first, keys "2".."N" from the second.
 Forward: CUDA events at module boundaries (forward hooks). Backward: gradient hooks on the same boundary tensors,
 between the start and end of Megatron's backward_step. Averages over the iterations after --sailor-skip-iters.
@@ -62,6 +71,11 @@ def first_tensor(output):
     return output[0] if isinstance(output, (tuple, list)) else output
 
 
+# parts of the second transformer layer, in forward order (see the docstring)
+DENSE_PARTS = ["attn", "mlp"]
+MOE_PARTS = ["attn", "router_permute", "dispatch", "sort_in", "experts", "sort_out", "combine", "unpermute"]
+
+
 class LayerProfiler:
     """Segments, in forward order: emb, L1..Ln, norm, head (output layer + loss)."""
 
@@ -79,6 +93,10 @@ class LayerProfiler:
         modules.update({f"L{i}": layer for i, layer in enumerate(self.layers, 1)})
         
         self.params = {s: numel_bytes(list(m.parameters())) for s, m in modules.items()}
+        params = list(gpt_model.parameters())
+        self.optimizer_elements = {  # expert parameters use the expert grid (allreduce == False)
+            "elements": sum(p.numel() for p in params),
+            "expert_elements": sum(p.numel() for p in params if not getattr(p, "allreduce", True))}
         self.iters = []  # per iteration: {event name: torch.cuda.Event}, contains the times of each step for each iteration
         self.mem = {}  # torch.cuda.memory_allocated() at each forward boundary for the last iteration only
         self.act = {}  # per segment: [(input numel, bytes), (output numel, bytes)], tensor sizes at each segment's input and output
@@ -92,6 +110,7 @@ class LayerProfiler:
             layer.register_forward_hook(self.boundary(f"L{i}"))
         self.norm.register_forward_hook(self.boundary("norm"))
         gpt_model.register_forward_hook(self.on_model_end)
+        self.parts = self.hook_parts(self.layers[1])
 
         # Add forward events for the optimizer steps
         step = optimizer.step
@@ -135,6 +154,41 @@ class LayerProfiler:
 
         return hook
 
+    def mark(self, part, out):
+        """End of a part of the second layer: forward event now, backward event when its output's gradient is
+        ready (the parts after it are done)."""
+        self.record(f"f_{part}")
+        if out.requires_grad:
+            out.register_hook(lambda grad: self.record(f"b_{part}"))
+
+    def hook_parts(self, layer):
+        """Marks the ends of all parts but the last (that one ends at the layer's output, f_L2 / b_L2)."""
+        mlp = layer.mlp
+        mlp.register_forward_pre_hook(lambda module, args: self.mark("attn", args[0]))
+        if not hasattr(mlp, "token_dispatcher"):
+            return DENSE_PARTS
+
+        def wrap(obj, method, part):
+            fn = getattr(obj, method)
+
+            def marked(*args, **kwargs):
+                out = fn(*args, **kwargs)
+                self.mark(part, first_tensor(out))
+                return out
+
+            setattr(obj, method, marked)
+
+        # MoELayer.forward: route, preprocess, dispatch, routed_experts_compute (dispatcher.dispatch_postprocess,
+        # experts, dispatcher.combine_preprocess), combine, postprocess
+        dispatcher = mlp.token_dispatcher
+        wrap(mlp, "preprocess", "router_permute")
+        wrap(mlp, "dispatch", "dispatch")
+        wrap(dispatcher, "dispatch_postprocess", "sort_in")
+        mlp.experts.register_forward_hook(lambda module, args, out: self.mark("experts", first_tensor(out)))
+        wrap(dispatcher, "combine_preprocess", "sort_out")
+        wrap(mlp, "combine", "combine")
+        return MOE_PARTS
+
     def on_model_end(self, module, args, output):
         self.record("f_end")
         self.mem["end"] = torch.cuda.memory_allocated()
@@ -150,31 +204,35 @@ class LayerProfiler:
         return timed_backward_step
 
     def times(self, skip):
-        """Per segment: mean forward and backward seconds; mean optimizer step; mean iteration (start to start)."""
+        """Mean seconds: forward and backward per segment and per part of the second layer; optimizer step;
+        iteration (start to start)."""
         torch.cuda.synchronize()
-        segs = self.segments
-        fwd_marks = ["f_start"] + [f"f_{s}" for s in segs[:-1]] + ["f_end"]
-        # gradient of a segment's output is ready when the segments after it are done
-        bwd_marks = ["b_start"] + [f"b_{s}" for s in reversed(segs[:-1])] + ["b_end"]
         rows = [it for it in self.iters if "o_end" in it]  # completed iterations (forward, backward, step)
         used = rows[skip:]
         assert used, f"only {len(rows)} iterations, need more than --sailor-skip-iters {skip}"
 
-        def ms(it, a, b):
-            return it[a].elapsed_time(it[b])
-
-        fwd = {s: [ms(it, fwd_marks[i], fwd_marks[i + 1]) for it in used] for i, s in enumerate(segs)}
-        bwd = {s: [ms(it, bwd_marks[len(segs) - 1 - i], bwd_marks[len(segs) - i]) for it in used]
-               for i, s in enumerate(segs)}
-        opt = [ms(it, "o_start", "o_end") for it in used]
-        nxt = [rows[skip + k + 1] for k in range(len(used) - 1)]
-        iteration = [it["f_start"].elapsed_time(n["f_start"]) for it, n in zip(used, nxt)]
-
         def mean_s(v):
             return round(sum(v) / len(v) / 1000, 6) if v else None
 
-        return ({s: mean_s(v) for s, v in fwd.items()}, {s: mean_s(v) for s, v in bwd.items()}, mean_s(opt),
-                mean_s(iteration))
+        def spans(names, f_first, f_last, b_first, b_last):
+            """Consecutive spans `names`, forward between f_<name> events, backward between b_<name> events
+            (the gradient of a span's output is ready when the spans after it are done)."""
+            fwd_marks = [f_first] + [f"f_{s}" for s in names[:-1]] + [f_last]
+            bwd_marks = [b_first] + [f"b_{s}" for s in reversed(names[:-1])] + [b_last]
+            n = len(names)
+            fwd = {s: mean_s([it[fwd_marks[i]].elapsed_time(it[fwd_marks[i + 1]]) for it in used])
+                   for i, s in enumerate(names)}
+            bwd = {s: mean_s([it[bwd_marks[n - 1 - i]].elapsed_time(it[bwd_marks[n - i]]) for it in used])
+                   for i, s in enumerate(names)}
+            return fwd, bwd
+
+        fwd, bwd = spans(self.segments, "f_start", "f_end", "b_start", "b_end")
+        part_fwd, part_bwd = spans(self.parts, "f_L1", "f_L2", "b_L2", "b_L1")
+        parts = {p: [part_fwd[p], part_bwd[p]] for p in self.parts}
+        opt = [it["o_start"].elapsed_time(it["o_end"]) for it in used]
+        nxt = [rows[skip + k + 1] for k in range(len(used) - 1)]
+        iteration = [it["f_start"].elapsed_time(n["f_start"]) for it, n in zip(used, nxt)]
+        return fwd, bwd, parts, mean_s(opt), mean_s(iteration)
 
     def mem_info(self, segment):
         prev = {"emb": "start", "head": "norm"}.get(segment) or self.segments[self.segments.index(segment) - 1]
@@ -189,7 +247,7 @@ class LayerProfiler:
         }
 
     def result(self, num_layers_original, skip):
-        fwd, bwd, opt, iteration = self.times(skip)
+        fwd, bwd, parts, opt, iteration = self.times(skip)
         n = num_layers_original
         source = {0: "emb", 1: "L1", n + 1: "norm", n + 2: "head"}
         source.update({k: "L2" for k in range(2, n + 1)})
@@ -213,9 +271,12 @@ class LayerProfiler:
                    f"[sailor-profile] GB: non-torch {gb(gpu['after_setup']['non_torch'])} after setup, "
                    f"{gb(end['non_torch'])} at end; peak allocated {gb(gpu['peak_allocated'])}, "
                    f"peak reserved {gb(gpu['peak_reserved'])}, peak device used (est.) "
-                   f"{gb(gpu['peak_device_used_est'])} of {gb(gpu['total'])}")
+                   f"{gb(gpu['peak_device_used_est'])} of {gb(gpu['total'])}\n"
+                   f"[sailor-profile] layer parts [fwd, bwd] {parts}\n"
+                   f"[sailor-profile] optimizer {self.optimizer_elements}")
 
-        return {"timing": timing, "memory": memory, "gpu_memory": gpu}, summary
+        return {"timing": timing, "memory": memory, "gpu_memory": gpu, "layer_parts": parts,
+                "optimizer": self.optimizer_elements}, summary
 
 
 def main():

@@ -39,15 +39,19 @@ MODELS = {
 }
 
 
-def megatron_args(model, tp, mbs, iters):
+def megatron_args(model, tp, mbs, iters, num_experts=None):
     arch, _, vocab, seq = MODELS[model]
+    if num_experts:
+        arch = list(arch)
+        arch[arch.index("--num-experts") + 1] = str(num_experts)
     args = arch + [
         "--num-layers", "2", "--seq-length", str(seq), "--max-position-embeddings", str(seq),
         "--tensor-model-parallel-size", str(tp), "--pipeline-model-parallel-size", "1",
         # one micro-batch per iteration; DP = 1 (world size = TP)
         "--micro-batch-size", str(mbs), "--global-batch-size", str(mbs), "--train-iters", str(iters),
         "--mock-data", "--tokenizer-type", "NullTokenizer", "--vocab-size", str(vocab),
-        "--bf16", "--use-distributed-optimizer", "--grad-reduce-in-bf16",  # bf16 grad buffer, as the planner assumes
+        # optimizer not sharded over DP (ZeRO-0, as original Sailor); bf16 gradient buffer, as the planner assumes
+        "--bf16", "--grad-reduce-in-bf16",
         "--lr", "1e-5", "--min-lr", "1e-6", "--lr-decay-style", "constant", "--clip-grad", "1.0",
         "--eval-iters", "0", "--eval-interval", str(iters), "--log-interval", "1",
     ]
@@ -81,11 +85,17 @@ def main():
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--skip-iters", type=int, default=5)
     parser.add_argument("--port", type=int, default=29500)
+    parser.add_argument("--num-experts", type=int,
+                        help="MoE models: experts per layer instead of the model's E, to time the experts as at "
+                             "EP = E / this (same tokens per GPU, E/EP experts with EP times the tokens each; "
+                             "layer_parts['experts'] in the profile). Files and logs named <model>-E<num>")
     parser.add_argument("--nsys", action="store_true",
                         help="trace runs for moetrace: nsys on iterations iters-6..iters-2 of every rank, everything "
                              "(also the profile JSON, disturbed by nsys) in <results-dir>/traces, not read by "
                              "gather_profs.py")
     args = parser.parse_args()
+    assert not args.num_experts or "--num-experts" in MODELS[args.model][0], f"{args.model} has no experts"
+    model_name = f"{args.model}-E{args.num_experts}" if args.num_experts else args.model
     assert not args.nsys or args.iters >= 8, "--nsys traces iterations iters-6..iters-2: needs --iters >= 8"
 
     profiler = Path(__file__).resolve().parent / "profile_mcore.py"
@@ -97,19 +107,19 @@ def main():
 
     for tp in args.tp:
         for mbs in args.mbs:
-            margs = megatron_args(args.model, tp, mbs, args.iters)
+            margs = megatron_args(args.model, tp, mbs, args.iters, args.num_experts)
             launch = [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(tp),
                       "--master-port", str(args.port)]
             run = [str(profiler)]
             if args.nsys:
-                name = f"{args.model}_tp{tp}_mbs{mbs}"
+                name = f"{model_name}_tp{tp}_mbs{mbs}"
                 margs += ["--profile", "--profile-step-start", str(steps[0]), "--profile-step-end", str(steps[1]),
                           "--profile-ranks", *map(str, range(tp)), "--nvtx-ranges"]
                 # torchrun starts nsys per rank, nsys starts Python; %q{RANK}: the rank torchrun sets
                 launch.append("--no-python")
                 run = NSYS + ["-o", str(out / f"{name}_rank%q{{RANK}}"), sys.executable] + run
             cmd = launch + run + [
-                "--sailor-model-name", args.model, "--sailor-gpu-type", args.gpu_type,
+                "--sailor-model-name", model_name, "--sailor-gpu-type", args.gpu_type,
                 "--sailor-results-dir", str(out),
                 "--sailor-num-layers-original", str(MODELS[args.model][1]),
                 "--sailor-skip-iters", str(args.skip_iters)] + margs
@@ -118,7 +128,7 @@ def main():
             env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(str(g) for g in range(tp)),
                        CUDA_DEVICE_MAX_CONNECTIONS="1")
             
-            log = logs / f"{args.model}_tp{tp}_mbs{mbs}.log"
+            log = logs / f"{model_name}_tp{tp}_mbs{mbs}.log"
             print(f"=== TP {tp} MBS {mbs} -> {log}", flush=True)
 
             with open(log, "w") as f:

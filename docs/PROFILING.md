@@ -149,13 +149,23 @@ Adapt the name of the baseline, GPU type, and number of GPUs per machine accordi
 `sailor/profiling/mcore/` profiles with the Megatron-Core copy in `third_party/Megatron-LM` (upstream `e429478`)
 instead of Megatron-DeepSpeed, and writes the same `profile_<model>_<gpu>_<tmp>_<mbs>.json` files, so step 2
 (`gather_profs.py`) and the planner are unchanged. Models: `LLAMA-3-8`, `QWEN3-30B-A3B` (EP = ETP = 1), defined in
-`profile_sweep.py`. Sequence parallelism is on when TP > 1. On Clariden, from `sailor/profiling/mcore`:
+`profile_sweep.py`. Sequence parallelism is on when TP > 1. The optimizer is not sharded over DP (ZeRO-0, as
+original Sailor), with bf16 gradients (`--grad-reduce-in-bf16`); see `docs/moe_iteration_time_model.md`. On
+Clariden, from `sailor/profiling/mcore`:
 
 ```bash
 sbatch profile_sweep.slurm LLAMA-3-8        # TP 1/2/4 x MBS 1/2/4/8 on one node -> $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/
 ```
 
-Method and output keys: docstring of `profile_mcore.py`.
+Method and output keys: docstring of `profile_mcore.py`. Besides the planner's inputs, each profile has
+`layer_parts` (one transformer layer split into attention, router, dispatch, experts, combine, ...),
+`optimizer` (parameters updated per GPU) and `gpu_memory`, for the MoE cost model in
+`docs/moe_iteration_time_model.md`. `--num-experts K` profiles an MoE model with K experts per layer (files named
+`<model>-E<K>`), to time the experts as at EP = E/K:
+
+```bash
+sbatch profile_sweep.slurm QWEN3-30B-A3B --num-experts 16
+```
 
 Nsight Systems traces for moe-comms' `moetrace` timelines: `--nsys` runs nsys on every rank for iterations
 `iters-6..iters-2` (Megatron's `--profile`, `--nvtx-ranges`) and writes `<name>_rank<R>.sqlite` and a `<name>.json`
