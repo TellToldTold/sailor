@@ -5,6 +5,8 @@
 #     sbatch profile_sweep.slurm <MODEL> [profile_sweep.py options]     e.g. sbatch profile_sweep.slurm LLAMA-3-8
 #
 # Profiles and per-run logs: $SCRATCH/sailor-profiles/<MODEL>/<job>/. Then ../gather_profs.py (docs/PROFILING.md).
+# Traces: sbatch profile_sweep.slurm <MODEL> --tp 2 --mbs 4 --iters 20 --nsys -> <job>/traces/, then from moe-comms:
+#     python -m moetrace extract <job>/traces && python -m moetrace view <job>/traces/tables -o page.html
 
 #SBATCH --job-name=sailor-prof
 #SBATCH --account=infra02

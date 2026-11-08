@@ -156,3 +156,14 @@ sbatch profile_sweep.slurm LLAMA-3-8        # TP 1/2/4 x MBS 1/2/4/8 on one node
 ```
 
 Method and output keys: docstring of `profile_mcore.py`.
+
+Nsight Systems traces for moe-comms' `moetrace` timelines: `--nsys` runs nsys on every rank for iterations
+`iters-6..iters-2` (Megatron's `--profile`, `--nvtx-ranges`) and writes `<name>_rank<R>.sqlite` and a `<name>.json`
+manifest to `<job>/traces/`. Trace runs are separate: their profiles (disturbed by nsys) stay in `traces/`.
+
+```bash
+sbatch profile_sweep.slurm LLAMA-3-8 --tp 2 --mbs 4 --iters 20 --nsys
+# from moe-comms:
+python -m moetrace extract $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/traces
+python -m moetrace view $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/traces/tables -o llama_tp2_mbs4.html
+```

@@ -1,8 +1,16 @@
 import argparse
+import json
 import os
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+# nsys per rank, started/stopped by Megatron (--profile: cudaProfilerStart/Stop), as moe-comms
+# slurm/40_pretrain_qwen3.slurm, so that moe-comms' moetrace (extract, view) reads the traces unchanged
+NSYS = ["nsys", "profile", "-t", "cuda,nvtx", "--sample=none", "--cpuctxsw=none",
+        "--capture-range=cudaProfilerApi", "--capture-range-end=stop", "--force-overwrite=true"]
 
 COMMON = [
     "--normalization", "RMSNorm", "--swiglu", "--disable-bias-linear", "--position-embedding-type", "rope",
@@ -48,6 +56,21 @@ def megatron_args(model, tp, mbs, iters):
     return args
 
 
+def export_traces(out, name, tp, margs, steps, start):
+    """moetrace's input: <name>_rank<R>.sqlite (with the NCCL NVTX payloads: --include-blobs) and <name>.json."""
+    for rank in range(tp):
+        rep = out / f"{name}_rank{rank}.nsys-rep"
+        if not rep.exists():
+            print(f"!!! no trace {rep}", flush=True)
+            continue
+        subprocess.run(["nsys", "export", "--type=sqlite", "--include-blobs=true", "--force-overwrite=true",
+                        "-o", str(rep.with_suffix(".sqlite")), str(rep)], stdout=subprocess.DEVNULL, check=False)
+    manifest = {"name": name, "job": os.environ.get("SLURM_JOB_ID"), "args": margs, "variant_args": [],
+                "nodes": [socket.gethostname().split(".")[0]], "ranks_per_node": tp, "profile_steps": steps,
+                "gpu_metrics_ranks": [], "start": start, "end": time.time()}
+    (out / f"{name}.json").write_text(json.dumps(manifest, indent=1))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
@@ -58,22 +81,40 @@ def main():
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--skip-iters", type=int, default=5)
     parser.add_argument("--port", type=int, default=29500)
+    parser.add_argument("--nsys", action="store_true",
+                        help="trace runs for moetrace: nsys on iterations iters-6..iters-2 of every rank, everything "
+                             "(also the profile JSON, disturbed by nsys) in <results-dir>/traces, not read by "
+                             "gather_profs.py")
     args = parser.parse_args()
+    assert not args.nsys or args.iters >= 8, "--nsys traces iterations iters-6..iters-2: needs --iters >= 8"
 
     profiler = Path(__file__).resolve().parent / "profile_mcore.py"
-    logs = Path(args.results_dir) / "logs"
+    out = Path(args.results_dir) / "traces" if args.nsys else Path(args.results_dir)
+    logs = out / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     failed = []
+    steps = [args.iters - 6, args.iters - 2]
 
     for tp in args.tp:
         for mbs in args.mbs:
-            cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(tp),
-                   "--master-port", str(args.port), str(profiler),
-                   "--sailor-model-name", args.model, "--sailor-gpu-type", args.gpu_type,
-                   "--sailor-results-dir", args.results_dir,
-                   "--sailor-num-layers-original", str(MODELS[args.model][1]),
-                   "--sailor-skip-iters", str(args.skip_iters)] + megatron_args(args.model, tp, mbs, args.iters)
-            
+            margs = megatron_args(args.model, tp, mbs, args.iters)
+            launch = [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(tp),
+                      "--master-port", str(args.port)]
+            run = [str(profiler)]
+            if args.nsys:
+                name = f"{args.model}_tp{tp}_mbs{mbs}"
+                margs += ["--profile", "--profile-step-start", str(steps[0]), "--profile-step-end", str(steps[1]),
+                          "--profile-ranks", *map(str, range(tp)), "--nvtx-ranges"]
+                # torchrun starts nsys per rank, nsys starts Python; %q{RANK}: the rank torchrun sets
+                launch.append("--no-python")
+                run = NSYS + ["-o", str(out / f"{name}_rank%q{{RANK}}"), sys.executable] + run
+            cmd = launch + run + [
+                "--sailor-model-name", args.model, "--sailor-gpu-type", args.gpu_type,
+                "--sailor-results-dir", str(out),
+                "--sailor-num-layers-original", str(MODELS[args.model][1]),
+                "--sailor-skip-iters", str(args.skip_iters)] + margs
+            start = time.time()
+
             env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(str(g) for g in range(tp)),
                        CUDA_DEVICE_MAX_CONNECTIONS="1")
             
@@ -88,6 +129,8 @@ def main():
             if code != 0:
                 print(f"!!! TP {tp} MBS {mbs} failed (exit {code})", flush=True)
                 failed.append((tp, mbs))
+            if args.nsys:
+                export_traces(out, name, tp, margs, steps, start)
 
     print(f"done; failed: {failed or 'none'}")
 
