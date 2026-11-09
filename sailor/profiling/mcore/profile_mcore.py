@@ -93,10 +93,10 @@ class LayerProfiler:
         modules.update({f"L{i}": layer for i, layer in enumerate(self.layers, 1)})
         
         self.params = {s: numel_bytes(list(m.parameters())) for s, m in modules.items()}
-        params = list(gpt_model.parameters())
-        self.optimizer_elements = {  # expert parameters use the expert grid (allreduce == False)
-            "elements": sum(p.numel() for p in params),
-            "expert_elements": sum(p.numel() for p in params if not getattr(p, "allreduce", True))}
+        # by name: Megatron's expert tag (param.allreduce == False) is not set on a single GPU
+        named = list(gpt_model.named_parameters())
+        self.optimizer_elements = {"elements": sum(p.numel() for _, p in named),
+                                   "expert_elements": sum(p.numel() for n, p in named if ".mlp.experts." in n)}
         self.iters = []  # per iteration: {event name: torch.cuda.Event}, contains the times of each step for each iteration
         self.mem = {}  # torch.cuda.memory_allocated() at each forward boundary for the last iteration only
         self.act = {}  # per segment: [(input numel, bytes), (output numel, bytes)], tensor sizes at each segment's input and output
