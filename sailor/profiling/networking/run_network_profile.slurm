@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Network profiling on Alps (Clariden), in the container the profiles and training runs use (../mcore/alps6.toml).
+# Network profiling on Alps (Clariden), in the container the profiles and training runs use (../../mcore/alps6.toml).
 # Submit from this directory:
 #
 #     sbatch --nodes=4 --time=00:20:00 run_network_profile.slurm a2a [test_alltoall.py options]   A2A, e = 2..16
@@ -28,7 +28,7 @@ cd "${SLURM_SUBMIT_DIR}"
 MODE="$1"; shift
 export OUT="${SCRATCH}/sailor-network/${SLURM_JOB_ID}" EXTRA="$*"
 export SAILOR_GIT="$(git rev-parse --short HEAD)$(git diff --quiet HEAD || echo -dirty)"
-EDF="$(realpath ../mcore/alps6.toml)"
+EDF="$(realpath ../../mcore/alps6.toml)"
 mapfile -t HOSTS < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 export MASTER_ADDR="${HOSTS[0]}" MASTER_PORT=29500
 mkdir -p "${OUT}"

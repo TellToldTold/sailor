@@ -245,3 +245,5 @@ aceso_logs/
 *.dsc
 *.idx
 *.jsonl
+docs/moe_iteration_time_model.md
+docs/moe_todo.md

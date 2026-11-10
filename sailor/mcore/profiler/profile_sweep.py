@@ -7,53 +7,14 @@ import sys
 import time
 from pathlib import Path
 
-# nsys per rank, started/stopped by Megatron (--profile: cudaProfilerStart/Stop), as moe-comms
-# slurm/40_pretrain_qwen3.slurm, so that moe-comms' moetrace (extract, view) reads the traces unchanged
-NSYS = ["nsys", "profile", "-t", "cuda,nvtx", "--sample=none", "--cpuctxsw=none",
-        "--capture-range=cudaProfilerApi", "--capture-range-end=stop", "--force-overwrite=true"]
-
-COMMON = [
-    "--normalization", "RMSNorm", "--swiglu", "--disable-bias-linear", "--position-embedding-type", "rope",
-    "--untie-embeddings-and-output-weights", "--attention-dropout", "0", "--hidden-dropout", "0",
-    # as Megatron's Llama-3 recipe (examples/llama/train_llama3_8b_h100_fp8.sh); default impl is native
-    "--cross-entropy-loss-fusion",
-]
-# (Megatron arguments without --num-layers, transformer layers of the full model, vocabulary size, sequence length)
-MODELS = {
-    # Llama-3-8B: 218,112,000 parameters per layer, as Planner/simulations/utils.py. The Megatron-DeepSpeed profile
-    # (llm_info.json) has ~268.5M: multi-head attention, FFN 4h = 16384 and biases.
-    "LLAMA-3-8": (COMMON + [
-        "--hidden-size", "4096", "--ffn-hidden-size", "14336", "--num-attention-heads", "32",
-        "--group-query-attention", "--num-query-groups", "8", "--norm-epsilon", "1e-5", "--rotary-base", "500000",
-    ], 32, 128256, 8192),
-    # as moe-comms slurm/40_pretrain_qwen3.slurm; EP = ETP = 1 (all 128 experts on each GPU)
-    "QWEN3-30B-A3B": (COMMON + [
-        "--hidden-size", "2048", "--ffn-hidden-size", "6144", "--num-attention-heads", "32",
-        "--group-query-attention", "--num-query-groups", "4", "--kv-channels", "128", "--qk-layernorm",
-        "--norm-epsilon", "1e-6", "--rotary-base", "1000000",
-        "--num-experts", "128", "--moe-router-topk", "8", "--moe-ffn-hidden-size", "768", "--moe-router-dtype", "fp32",
-        "--moe-router-load-balancing-type", "aux_loss", "--moe-aux-loss-coeff", "1e-3", "--moe-grouped-gemm",
-        "--moe-permute-fusion", "--moe-router-fusion", "--moe-token-dispatcher-type", "alltoall",
-        "--expert-model-parallel-size", "1", "--expert-tensor-parallel-size", "1",
-    ], 48, 151936, 4096),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # mcore/: models.py
+from models import ENV, MODELS, NSYS, model_args, num_experts  # noqa: E402
 
 
 def megatron_args(model, tp, mbs, iters, num_experts=None):
-    arch, _, vocab, seq = MODELS[model]
-    if num_experts:
-        arch = list(arch)
-        arch[arch.index("--num-experts") + 1] = str(num_experts)
-    args = arch + [
-        "--num-layers", "2", "--seq-length", str(seq), "--max-position-embeddings", str(seq),
+    args = model_args(model, 2, iters, num_experts) + [
         "--tensor-model-parallel-size", str(tp), "--pipeline-model-parallel-size", "1",
-        # one micro-batch per iteration; DP = 1 (world size = TP)
-        "--micro-batch-size", str(mbs), "--global-batch-size", str(mbs), "--train-iters", str(iters),
-        "--mock-data", "--tokenizer-type", "NullTokenizer", "--vocab-size", str(vocab),
-        # optimizer not sharded over DP (ZeRO-0, as original Sailor); bf16 gradient buffer, as the planner assumes
-        "--bf16", "--grad-reduce-in-bf16",
-        "--lr", "1e-5", "--min-lr", "1e-6", "--lr-decay-style", "constant", "--clip-grad", "1.0",
-        "--eval-iters", "0", "--eval-interval", str(iters), "--log-interval", "1",
+        "--micro-batch-size", str(mbs), "--global-batch-size", str(mbs),
     ]
     if tp > 1:
         args.append("--sequence-parallel")
@@ -61,7 +22,7 @@ def megatron_args(model, tp, mbs, iters, num_experts=None):
 
 
 def export_traces(out, name, tp, margs, steps, start):
-    """moetrace's input: <name>_rank<R>.sqlite (with the NCCL NVTX payloads: --include-blobs) and <name>.json."""
+    """<name>_rank<R>.sqlite (with the NCCL NVTX payloads: --include-blobs) and <name>.json."""
     for rank in range(tp):
         rep = out / f"{name}_rank{rank}.nsys-rep"
         if not rep.exists():
@@ -86,15 +47,12 @@ def main():
     parser.add_argument("--skip-iters", type=int, default=5)
     parser.add_argument("--port", type=int, default=29500)
     parser.add_argument("--num-experts", type=int,
-                        help="MoE models: experts per layer instead of the model's E, to time the experts as at "
-                             "EP = E / this (same tokens per GPU, E/EP experts with EP times the tokens each; "
-                             "layer_parts['experts'] in the profile). Files and logs named <model>-E<num>")
+                        help="experts per layer instead of the model's E. Files and logs named <model>-E<num>")
     parser.add_argument("--nsys", action="store_true",
-                        help="trace runs for moetrace: nsys on iterations iters-6..iters-2 of every rank, everything "
-                             "(also the profile JSON, disturbed by nsys) in <results-dir>/traces, not read by "
-                             "gather_profs.py")
+                        help="trace runs for moetrace: nsys on iterations iters-6..iters-2 of every rank, everything in <results-dir>/traces")
     args = parser.parse_args()
-    assert not args.num_experts or "--num-experts" in MODELS[args.model][0], f"{args.model} has no experts"
+    
+    assert not args.num_experts or num_experts(args.model), f"{args.model} has no experts"
     model_name = f"{args.model}-E{args.num_experts}" if args.num_experts else args.model
     assert not args.nsys or args.iters >= 8, "--nsys traces iterations iters-6..iters-2: needs --iters >= 8"
 
@@ -121,12 +79,11 @@ def main():
             cmd = launch + run + [
                 "--sailor-model-name", model_name, "--sailor-gpu-type", args.gpu_type,
                 "--sailor-results-dir", str(out),
-                "--sailor-num-layers-original", str(MODELS[args.model][1]),
+                "--sailor-num-layers-original", str(MODELS[args.model]["num_layers"]),
                 "--sailor-skip-iters", str(args.skip_iters)] + margs
             start = time.time()
 
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(str(g) for g in range(tp)),
-                       CUDA_DEVICE_MAX_CONNECTIONS="1")
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(str(g) for g in range(tp)), **ENV)
             
             log = logs / f"{model_name}_tp{tp}_mbs{mbs}.log"
             print(f"=== TP {tp} MBS {mbs} -> {log}", flush=True)

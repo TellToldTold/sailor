@@ -146,12 +146,13 @@ Adapt the name of the baseline, GPU type, and number of GPUs per machine accordi
 
 ## 3. Model profiling with Megatron-Core (Alps)
 
-`sailor/profiling/mcore/` profiles with the Megatron-Core copy in `third_party/Megatron-LM` (upstream `e429478`)
+`sailor/mcore/profiler/` profiles with the Megatron-Core copy in `third_party/Megatron-LM` (upstream `e429478`)
 instead of Megatron-DeepSpeed, and writes the same `profile_<model>_<gpu>_<tmp>_<mbs>.json` files, so step 2
-(`gather_profs.py`) and the planner are unchanged. Models: `LLAMA-3-8`, `QWEN3-30B-A3B` (EP = ETP = 1), defined in
-`profile_sweep.py`. Sequence parallelism is on when TP > 1. The optimizer is not sharded over DP (ZeRO-0, as
+(`gather_profs.py`) and the planner are unchanged. Models: `LLAMA-3-8`, `QWEN3-30B-A3B`, `MIXTRAL-8X7B` (EP = ETP = 1), defined once in Sailor's training
+configs (`sailor/Planner/simulations/configs/training_config_<model>.json`, also read by the simulator and planner);
+`sailor/mcore/models.py` turns them into Megatron arguments and adds the settings and environment every run shares. Sequence parallelism is on when TP > 1. The optimizer is not sharded over DP (ZeRO-0, as
 original Sailor), with bf16 gradients (`--grad-reduce-in-bf16`); see `docs/moe_iteration_time_model.md`. On
-Clariden, from `sailor/profiling/mcore`:
+Clariden, from `sailor/mcore/profiler`:
 
 ```bash
 sbatch profile_sweep.slurm LLAMA-3-8        # TP 1/2/4 x MBS 1/2/4/8 on one node -> $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/
@@ -177,3 +178,33 @@ sbatch profile_sweep.slurm LLAMA-3-8 --tp 2 --mbs 4 --iters 20 --nsys
 python -m moetrace extract $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/traces
 python -m moetrace view $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/traces/tables -o llama_tp2_mbs4.html
 ```
+
+Layout of `sailor/mcore/` (Megatron-Core runs on Alps): `models.py` (the models' training configs as Megatron
+arguments, shared settings, environment, nsys command), `megatron_hooks.py` (fast NVTX names, routing counts), `alps6.toml` (container), `profiler/` (per-layer
+profiles: `profile_mcore.py`, `profile_sweep.py`, `profile_sweep.slurm`), `validation/` (training runs of one plan:
+`validation_run.py`, `validation_run.slurm`, per-rank `train_mcore.py`).
+
+### Validation runs (Megatron-Core training of one plan)
+
+`sailor/mcore/validation/validation_run.slurm` runs one plan of a model in `models.py` (same model, settings
+and environment as the profiles, through `model_args` and `ENV`) on N nodes, with nsys traces in the layout of moe-comms'
+`slurm/40_pretrain_qwen3.slurm`, so moe-comms' `moetrace` reads them unchanged. Regime of the MoE cost model
+(`docs/moe_iteration_time_model.md`): `alltoall` dispatcher, ETP 1, ZeRO-0, no overlap flags, mock data. World = N × 4,
+DP = world / (TP × PP); the plan is checked before the run (TP within a node, EP divides E and TP × DP, GBS divisible
+by MBS × DP, layers by PP).
+
+```bash
+cd sailor/mcore/validation
+sbatch --nodes=1 validation_run.slurm QWEN3-30B-A3B --tp 1 --ep 4 --mbs 1 --gbs 16
+sbatch --nodes=2 validation_run.slurm MIXTRAL-8X7B --tp 2 --pp 2 --ep 2 --mbs 1 --gbs 16 --layers 8
+# options: --layers L (default: full model), --iters I (20), --no-nsys, --gpu-metrics-ranks "0"
+# from moe-comms:
+python -m moetrace extract $SCRATCH/sailor-validation/<job> && python -m moetrace view $SCRATCH/sailor-validation/<job>/tables -o page.html
+```
+
+Output in `$SCRATCH/sailor-validation/<job>/`: `<name>.log` (Megatron's output), `<name>.json` (moetrace manifest,
+plus the plan and Megatron's per-iteration times; the validation time is the median over the untraced iterations
+6..iters-7), traces `<name>_rank<R>.{nsys-rep,sqlite}` (iterations iters-6..iters-2, NCCL payloads kept), routing
+counts `<name>_rank<R>_routing.npz`, and `<name>_plan_config.json` in the format of Sailor's validation
+(`Planner/simulations/validation/clariden/<MODEL>/N<n>/`, `"real"` in seconds, plus `"ep"`). Traced runs use moe-comms'
+fast NVTX names (`mcore/megatron_hooks.py`; Megatron's own costs ~0.1 ms per range); the profiler does the same with `--nsys`.

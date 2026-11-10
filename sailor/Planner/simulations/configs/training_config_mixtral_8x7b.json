@@ -1,0 +1,22 @@
+{
+	"type": "gpt2",
+	"optimizer": "Adam",
+	"global_batch_size": 1024,
+	"model": "MIXTRAL-8X7B",
+	"hidden_size": 4096,
+	"sequence_length": 4096,
+	"max_position_embeddings": 4096,
+	"num_layers": 32,
+	"num_all_layers": 35,
+	"vocab_size": 32000,
+	"heads": 32,
+	"head_dim": 128,
+	"ffn_hidden_size": 14336,
+	"num_query_groups": 8,
+	"norm_epsilon": 1e-05,
+	"rotary_base": 1000000,
+	"num_experts": 8,
+	"moe_router_topk": 2,
+	"moe_ffn_hidden_size": 14336,
+	"moe_aux_loss_coeff": 0.02
+}

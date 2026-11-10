@@ -15,18 +15,10 @@ input/output activation sizes and the memory allocated during the layer's forwar
 (not read by gather_profs.py): whole-GPU bytes on rank 0 after setup and at the end (non-PyTorch overhead), and
 peaks over the measured iterations, to set and check the simulator's megatron_mem.
 
-Also not read by gather_profs.py (docs/moe_iteration_time_model.md):
-- "layer_parts": {part: [fwd, bwd]} in seconds, the second transformer layer (keys "2".."N") split into parts.
-  Dense: "attn" (layer input to MLP input) and "mlp" (MLP and residual add; with TE the pre-MLP norm is fused into
-  the MLP's first GEMM). MoE: "attn" (with the pre-MLP norm), "router_permute", "dispatch" (A2A), "sort_in"
-  (regroup by local expert), "experts" (grouped GEMMs), "sort_out", "combine" (A2A), "unpermute" (with the
-  residual add). Event at each part's output in the forward, gradient hook on the same tensor in the backward.
-- "optimizer": {"elements", "expert_elements"}: parameters on this GPU, all updated by its optimizer step
-  (no --use-distributed-optimizer: ZeRO-0), to fit the step time as rate x elements + constant.
-
 The model is profiled with 2 transformer layers: key "1" from the first, keys "2".."N" from the second.
 Forward: CUDA events at module boundaries (forward hooks). Backward: gradient hooks on the same boundary tensors,
-between the start and end of Megatron's backward_step. Averages over the iterations after --sailor-skip-iters.
+between the start and end of Megatron's backward_step. Averages over the iterations after --sailor-skip-iters;
+"iterations" keeps the times of every completed iteration (segments, layer parts, update, iteration).
 Requires PP = 1 and one micro-batch per iteration (global batch = micro batch x DP).
 """
 
@@ -42,6 +34,7 @@ import torch
 # our copy of Megatron must come first on the path, before any megatron import
 MEGATRON = Path(__file__).resolve().parents[3] / "third_party" / "Megatron-LM"
 sys.path.insert(0, str(MEGATRON))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # mcore/: megatron_hooks.py
 
 import megatron.core  # noqa: E402
 import megatron.core.pipeline_parallel.schedules as schedules  # noqa: E402
@@ -93,10 +86,10 @@ class LayerProfiler:
         modules.update({f"L{i}": layer for i, layer in enumerate(self.layers, 1)})
         
         self.params = {s: numel_bytes(list(m.parameters())) for s, m in modules.items()}
-        # by name: Megatron's expert tag (param.allreduce == False) is not set on a single GPU
+        # get the number of parameters that are on the GPU, total (elements) and subset of the expert ones (expert_elements)
         named = list(gpt_model.named_parameters())
         self.optimizer_elements = {"elements": sum(p.numel() for _, p in named),
-                                   "expert_elements": sum(p.numel() for n, p in named if ".mlp.experts." in n)}
+                                   "expert_elements": sum(p.numel() for n, p in named if ".mlp.experts." in n)} # just for an analytic check, not used in planner
         self.iters = []  # per iteration: {event name: torch.cuda.Event}, contains the times of each step for each iteration
         self.mem = {}  # torch.cuda.memory_allocated() at each forward boundary for the last iteration only
         self.act = {}  # per segment: [(input numel, bytes), (output numel, bytes)], tensor sizes at each segment's input and output
@@ -165,6 +158,8 @@ class LayerProfiler:
         """Marks the ends of all parts but the last (that one ends at the layer's output, f_L2 / b_L2)."""
         mlp = layer.mlp
         mlp.register_forward_pre_hook(lambda module, args: self.mark("attn", args[0]))
+
+        # if not an MoE model
         if not hasattr(mlp, "token_dispatcher"):
             return DENSE_PARTS
 
@@ -204,35 +199,45 @@ class LayerProfiler:
         return timed_backward_step
 
     def times(self, skip):
-        """Mean seconds: forward and backward per segment and per part of the second layer; optimizer step;
-        iteration (start to start)."""
+        """Seconds per completed iteration (all of them, from the first): forward and backward per segment and per
+        part of the second layer, optimizer step, iteration (start to start of the next). Means over the iterations
+        after `skip`: fwd, bwd, parts, update, iteration."""
         torch.cuda.synchronize()
         rows = [it for it in self.iters if "o_end" in it]  # completed iterations (forward, backward, step)
-        used = rows[skip:]
-        assert used, f"only {len(rows)} iterations, need more than --sailor-skip-iters {skip}"
+        assert len(rows) > skip, f"only {len(rows)} iterations, need more than --sailor-skip-iters {skip}"
 
-        def mean_s(v):
-            return round(sum(v) / len(v) / 1000, 6) if v else None
+        def s(ms):
+            return round(ms / 1000, 6)
 
         def spans(names, f_first, f_last, b_first, b_last):
             """Consecutive spans `names`, forward between f_<name> events, backward between b_<name> events
-            (the gradient of a span's output is ready when the spans after it are done)."""
-            fwd_marks = [f_first] + [f"f_{s}" for s in names[:-1]] + [f_last]
-            bwd_marks = [b_first] + [f"b_{s}" for s in reversed(names[:-1])] + [b_last]
+            (the gradient of a span's output is ready when the spans after it are done): {name: [[fwd, bwd] per
+            iteration]}."""
+            fwd_marks = [f_first] + [f"f_{x}" for x in names[:-1]] + [f_last]
+            bwd_marks = [b_first] + [f"b_{x}" for x in reversed(names[:-1])] + [b_last]
             n = len(names)
-            fwd = {s: mean_s([it[fwd_marks[i]].elapsed_time(it[fwd_marks[i + 1]]) for it in used])
-                   for i, s in enumerate(names)}
-            bwd = {s: mean_s([it[bwd_marks[n - 1 - i]].elapsed_time(it[bwd_marks[n - i]]) for it in used])
-                   for i, s in enumerate(names)}
-            return fwd, bwd
+            return {x: [[s(it[fwd_marks[i]].elapsed_time(it[fwd_marks[i + 1]])),
+                         s(it[bwd_marks[n - 1 - i]].elapsed_time(it[bwd_marks[n - i]]))] for it in rows]
+                    for i, x in enumerate(names)}
 
-        fwd, bwd = spans(self.segments, "f_start", "f_end", "b_start", "b_end")
-        part_fwd, part_bwd = spans(self.parts, "f_L1", "f_L2", "b_L2", "b_L1")
-        parts = {p: [part_fwd[p], part_bwd[p]] for p in self.parts}
-        opt = [it["o_start"].elapsed_time(it["o_end"]) for it in used]
-        nxt = [rows[skip + k + 1] for k in range(len(used) - 1)]
-        iteration = [it["f_start"].elapsed_time(n["f_start"]) for it, n in zip(used, nxt)]
-        return fwd, bwd, parts, mean_s(opt), mean_s(iteration)
+        per_it = {
+            "n": list(range(1, len(rows) + 1)),  # Megatron's iteration numbers
+            "skip": skip,  # the means use n > skip
+            "segments": spans(self.segments, "f_start", "f_end", "b_start", "b_end"),
+            "parts": spans(self.parts, "f_L1", "f_L2", "b_L2", "b_L1"),
+            "update": [s(it["o_start"].elapsed_time(it["o_end"])) for it in rows],
+            # start to start of the next: none for the last iteration
+            "iteration": [s(it["f_start"].elapsed_time(nxt["f_start"])) for it, nxt in zip(rows, rows[1:])],
+        }
+
+        def mean(v):
+            v = v[skip:]
+            return round(sum(v) / len(v), 6) if v else None
+
+        fwd = {x: mean([fb[0] for fb in v]) for x, v in per_it["segments"].items()}
+        bwd = {x: mean([fb[1] for fb in v]) for x, v in per_it["segments"].items()}
+        parts = {x: [mean([fb[0] for fb in v]), mean([fb[1] for fb in v])] for x, v in per_it["parts"].items()}
+        return fwd, bwd, parts, mean(per_it["update"]), mean(per_it["iteration"]), per_it
 
     def mem_info(self, segment):
         prev = {"emb": "start", "head": "norm"}.get(segment) or self.segments[self.segments.index(segment) - 1]
@@ -247,7 +252,7 @@ class LayerProfiler:
         }
 
     def result(self, num_layers_original, skip):
-        fwd, bwd, parts, opt, iteration = self.times(skip)
+        fwd, bwd, parts, opt, iteration, per_it = self.times(skip)
         n = num_layers_original
         source = {0: "emb", 1: "L1", n + 1: "norm", n + 2: "head"}
         source.update({k: "L2" for k in range(2, n + 1)})
@@ -276,7 +281,7 @@ class LayerProfiler:
                    f"[sailor-profile] optimizer {self.optimizer_elements}")
 
         return {"timing": timing, "memory": memory, "gpu_memory": gpu, "layer_parts": parts,
-                "optimizer": self.optimizer_elements}, summary
+                "optimizer": self.optimizer_elements, "iterations": per_it}, summary
 
 
 def main():
@@ -317,6 +322,10 @@ def main():
             print(f"[sailor-profile] wrote {path}", flush=True)
         
         return out
+
+    if "--nvtx-ranges" in megatron_argv:  # traced runs: NVTX names without inspect (megatron_hooks)
+        import megatron_hooks
+        megatron_hooks.fast_nvtx_names()
 
     if os.environ.get("RANK", "0") == "0":
         print(f"[sailor-profile] megatron from {Path(megatron.core.__file__).parent}", flush=True)
