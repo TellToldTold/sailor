@@ -9,7 +9,7 @@ For every phase of an iteration this document gives:
 
 - what happens, in order;
 - what its duration depends on;
-- whether we **measure** it (profiler or benchmark) or **calculate** it (formula plus network model);
+- whether we **measure** it (model profiler or network profiler) or **calculate** it (formula plus network model);
 - why that number stays correct when the other settings of the plan change.
 
 The last point is the important one. Sailor profiles a few small configurations on one node and predicts large
@@ -37,9 +37,14 @@ exactly, and everything else is calculated.
   - Cost: memory. 2 + 2 + 12 = 16 bytes per parameter on every DP copy, instead of 2 + 2 + 12/d.
   - Moving to the distributed optimizer later changes two things: the step's element count is divided by d (or EDP),
     and the all-reduce splits into a reduce-scatter before the step and an all-gather after it.
+- **Sequence length s is fixed by the training job**, as in original Sailor (`training_config["sequence_length"]`):
+  the planner never chooses it. Every measured number is per (t, b) *at that s*, and profiles are only valid for
+  jobs with the same s. Attention grows with s², the rest with s, so a profile can't be rescaled to another s.
+  Today nothing checks this; a cheap safeguard is to record s in the profile and compare it with the training
+  config.
 - 1F1B pipeline schedule without interleaving; bf16 with `--grad-reduce-in-bf16` (2-byte gradients); sequence
   parallelism on when TP > 1; no activation recomputation. These match our profiler settings
-  (`sailor/profiling/mcore/profile_sweep.py`).
+  (`sailor/mcore/models.py`, `profiler/profile_sweep.py`).
 
 **Symbols**
 
@@ -67,7 +72,7 @@ The case we profiled with TP 4 and EP 1 is EDP = 4: every GPU holds all 128 expe
 
 In order:
 
-1. Zero the gradient buffers.
+1. Zero the gradient buffers. Negligible, so ignored (section 2.4).
 2. **Pipeline phase**: m micro-batches go forward and backward through the p stages (1F1B). Inside it, each
    transformer layer runs attention and then the MoE block. The MoE block contains the token all-to-alls, A2A for
    short.
@@ -77,7 +82,7 @@ In order:
    weights.
 
 ```
-T_iter = T_zero + T_pipeline + T_grad_sync + T_step
+T_iter = T_pipeline + T_grad_sync + T_step
 ```
 
 This has the same structure as today's Sailor simulator, `T_iter = T_pp + T_sync` (`runtime_simulator.py:401-462`):
@@ -106,6 +111,16 @@ This is Sailor's formula (`get_time_per_pipeline`, `runtime_simulator.py:339-399
 Why: the first micro-batch has to go through every stage and come back. That's the fill and drain of the pipeline,
 the Σ term. The other m − 1 micro-batches leave the pipeline at the rate of the slowest stage, which can't work
 faster than one micro-batch per C_j + Q_j. For equal stages this gives the textbook (m + p − 1) · (C + Q).
+
+Our stages are usually **not** equal, even in a homogeneous plan:
+- the first stage also holds the embedding, and the last the final norm, output layer and loss (for LLAMA the
+  output layer alone is 2–3 layers of compute);
+- the layer count may not divide evenly over p;
+- the last stage has no P2P send (Q = 0).
+
+So we keep the general form. It becomes the textbook one when the planner balances the stages well (for example
+fewer layers on the first and last stage). The max term is what penalises a bad split, which is why the planner
+needs it to compare splits.
 
 It doesn't change for MoE. The A2As happen *inside* a stage's layers, so they're part of C_j, not of Q_j. All
 GPUs of one EP group are in the same pipeline stage, possibly in different DP replicas. All replicas run the same
@@ -137,8 +152,10 @@ gradient). The embedding has no input gradient, because its input is token ids.
 | F1 | Attention block | RMSNorm, all-gather of the sequence over TP, QKV GEMM, flash attention, output projection, reduce-scatter over TP, residual add, then the pre-MLP RMSNorm (the `layer.mlp` event comes after it) | t, b, s, model shape | **measure** (profiler, per TP and MBS) |
 | F2 | Router | Router GEMM (h × E) on T_loc tokens, softmax and top-k, aux-loss terms | T_loc, h, E | **measure** (profiler) |
 | F3 | Permute | Copy each token k times and sort the copies by expert: T_loc·k rows of h | T_loc, k, h | **measure** (profiler) |
-| F4 | Dispatch A2A | Send each copy to the GPU that holds its expert, over the EP group | bytes, e, nodes spanned | **calculate** (A2A model) |
-| F5 | Expert MLPs | Grouped GEMM over the E/e local experts, with T_loc·k·e/E tokens each (SwiGLU: two GEMMs, activation, one GEMM) | E/e and tokens per expert | **measure** (benchmark) |
+| F4 | Dispatch A2A | Send each copy to the GPU that holds its expert, over the EP group | bytes, e, nodes spanned | **calculate** (A2A bandwidth curves) |
+| S1 | Sort in | Regroup the received rows from sender order to local-expert order, so each expert's rows are contiguous for the grouped GEMM (`dispatch_postprocess`, permutation 2). A copy of T_loc·k rows of h. At EP = 1 it also holds the GPU-to-CPU synchronisation of the per-expert counts. | T_loc, k, h | **measure** (profiler `sort_in`, base profile) |
+| F5 | Expert MLPs | Grouped GEMM over the E/e local experts, with T_loc·k·e/E tokens each (SwiGLU: two GEMMs, activation, one GEMM) | E/e and tokens per expert | **measure** (profiler with `--num-experts E/e`) |
+| S2 | Sort out | The inverse of S1: put the expert outputs back in sender order for the combine A2A (`combine_preprocess`) | T_loc, k, h | **measure** (profiler `sort_out`, base profile) |
 | F6 | Combine A2A | Send the outputs back to their tokens' GPUs (the reverse of F4) | same as F4 | **calculate** |
 | F7 | Unpermute | Undo the sort, weight by the router probabilities, sum the k copies, residual add | T_loc, k, h | **measure** (with F3) |
 
@@ -173,9 +190,9 @@ With ETP = 1 the MoE block has **no TP communication**. Each GPU runs its own T_
 and the output already has the full hidden size h for those tokens. That's what keeps F2–F7 independent of t
 except through T_loc.
 
-> To check in an nsys trace: that Megatron's A2A dispatcher really skips any TP all-gather when ETP = 1 with
-> sequence parallelism. The parameter counts we measured (full experts on every GPU at TP 4) point that way, but we
-> haven't looked at the kernels.
+Confirmed in Megatron's code: the dispatcher's "TP" group is the **expert** TP group
+(`megatron/core/transformer/moe/token_dispatcher.py:89`, `self.tp_group = pg_collection.expt_tp`). With ETP = 1 it
+has size 1, so the TP all-gather in `dispatch_postprocess` (`:743`) never runs.
 
 Below, each row is explained.
 
@@ -185,8 +202,7 @@ E1 and H1–H3 are measured and carry over for the same reasons as F1: only this
 on shapes fixed by (t, b, s) and the model. The profiler already records them as separate keys (0, N+1, N+2).
 
 - **What we measure:** with the profiler, the time from the layer's input to the MoE block's input, forward and
-  backward, for each (t, b). Today's profiler records the whole layer. We need one more event at the MoE block's
-  boundary (`layer.mlp`) to split it.
+  backward, for each (t, b): the `attn` part of the profile's `layer_parts` (event at the input of `layer.mlp`).
 - **Why the number carries over:**
   - Everything in F1 involves only this GPU and its t − 1 TP partners: the same kernels on the same tensor shapes
     (b, s, h/t per GPU), and the same TP collectives over the same links (NVLink, because TP is within a node).
@@ -196,42 +212,127 @@ on shapes fixed by (t, b, s) and the model. The profiler already records them as
   - So the profile at (t, b) gives the time of F1 in any plan with the same (t, b).
 - This is exactly the assumption Sailor already makes for dense models.
 
-#### F2, F3, F7 Router, permute, unpermute: measured
+#### F2, F3, S1, S2, F7 Router, permute, sorts, unpermute: measured
 
-- **What we measure:** the time from the MoE block's input to the start of dispatch (F2 + F3), and from the end of
-  combine to the block's output (F7), forward and backward. With the profiler at EP = 1, using hooks on the router
-  and the token dispatcher.
-- **Why the number carries over:**
-  - These are local operations on this GPU's T_loc tokens, with sizes T_loc × h, T_loc × E and T_loc·k × h.
-  - Under balanced routing, the permutation's input and output sizes don't depend on e. Only which rows go to
-    which destination changes, and that doesn't change the cost of a sort and copy.
-  - Measured at (t, b), they hold for any e, d, p.
-- One caveat: Megatron's A2A dispatcher copies the token counts per expert from GPU to CPU (a synchronisation)
-  before it can size the A2A. That's a fixed cost per layer. It shows up in this measurement, not in the A2A
-  benchmark, which is correct as long as it doesn't grow with e. We'll check in a trace.
+- **What we measure:** with the profiler at EP = 1, the `layer_parts` `router_permute` (F2 + F3), `sort_in`,
+  `sort_out` and `unpermute` (F7), forward and backward.
+- **The local work is the same at EP = 1 as at EP > 1.** From Megatron's A2A dispatcher
+  (`megatron/core/transformer/moe/token_dispatcher.py`):
+
+  | Step | Work | Changes with e? |
+  |---|---|---|
+  | Router | GEMM T_loc × h × E, softmax, top-k over all E experts | no |
+  | Permute 1 (`dispatch_preprocess`) | copy and sort T_loc·k rows by expert; dropless, so the size is fixed at T_loc·k (`:556`) | no |
+  | Permute 2 (`sort_chunks_by_idxs`, `:785` after dispatch, `:820` before combine): our `sort_in`, `sort_out` | regroup the received rows by local expert. Runs whenever there's more than one local expert, so at EP = 1 too. Rows T_loc·k; chunks e × E/e = E, constant. | no |
+  | Unpermute | inverse of permute 1, weighted sum of the k copies | no |
+  | Count exchange (`preprocess`, `:560-599`) | all-gather of the per-expert token counts over the EP group, then a GPU-to-CPU synchronisation for the A2A's split sizes | **only at EP > 1**; at EP = 1 there's still one GPU-to-CPU synchronisation (`:605`), for the grouped GEMM's counts |
+
+  So the only extra local cost at EP > 1 is the count all-gather: a few bytes, latency only. It goes into the
+  A2A term (F4/F6), not into the measured parts.
+- **Why the number carries over:** these are local operations on this GPU's T_loc tokens, sized T_loc × h,
+  T_loc × E and T_loc·k × h. Under balanced routing none of them depends on e; only where the rows go changes, not
+  the cost of sorting and copying them. Measured at (t, b), they hold for any e, d, p.
+- **Caveat:** the GPU-to-CPU synchronisation stops the CPU from queueing kernels ahead, so GPU idle time can follow
+  it. That's the same at every e, so it's inside the measurement, but it's a reason our no-overlap model may need
+  a constant per layer.
 
 #### F4, F6 Dispatch and combine A2A: calculated
 
-- **Volume:** each GPU sends T_loc·k rows of h bf16 values: `V = T_loc · k · h · 2 bytes`.
-  - A fraction 1/e stays on the GPU; the rest goes to the other e − 1 GPUs of its EP group, in equal parts under
-    balanced routing. It receives the same amount.
-  - For Qwen3 at b = 1 and t = 1: V = 4096 · 8 · 2048 · 2 B = 134 MB per A2A per GPU.
-- **Time:** `A2A(V, e, nodes spanned by the EP group)`, from an A2A cost model. That's one curve per (e, layout),
-  measured once per cluster with an NCCL A2A benchmark; moe-comms already has such measurements for Alps.
-  - With Megatron's default rank order, the EP group takes consecutive GPUs, so it fills a node before it uses the
-    next one. With 4 GPUs per node, e ≤ 4 stays inside a node, and e = 8 spans 2 nodes. To confirm against
-    Megatron's process-group code.
-  - Once the group spans nodes, the inter-node part (1/e of V to each GPU on another node) goes over the NICs and
-    dominates.
-- **Why calculate instead of measure:**
-  - The A2A depends on e and on how many nodes the EP group spans. A one-node profile can't reproduce plans whose
-    EP spans nodes.
-  - The A2A's duration depends only on how many bytes each GPU sends to each other GPU and over which links,
-    whatever the model does around it. So a benchmark curve indexed by (bytes, e, layout) is sufficient.
-  - This is the same reasoning Sailor uses for DP all-reduce and P2P sends (network coefficients).
-- **Biases to remember:**
-  - Imbalanced routing makes the most loaded GPU send and receive more than V.
-  - Megatron's A2A is preceded by the GPU-to-CPU count synchronisation (counted in F3).
+**Bytes.** Each GPU sends T_loc·k rows of h bf16 values per token A2A:
+
+```
+V = T_loc · k · h · 2 B  =  b · s · k · h · 2 / t
+```
+
+For Qwen3: 134 MB at b = 1, t = 1; from 33.5 MB (b = 1, t = 4) to 1.07 GB (b = 8, t = 1).
+
+**Where the bytes go.** Under balanced routing each GPU sends V/e to each of the e GPUs of its EP group. With
+Megatron's default rank order the EP group takes consecutive ranks, so it fills a node before it uses the next one
+(to confirm in Megatron's process-group code). With g = min(e, 4) GPUs of the group on each node and
+n_nodes = e / g nodes, each GPU sends:
+
+- 1 part to itself: a local copy at memory speed, negligible;
+- g − 1 parts over **NVLink**: `V_nvlink = V · (g − 1) / e`;
+- e − g parts over the **network** (one NIC per GH200): `V_net = V · (e − g) / e`.
+
+**Time.** Both links work at the same time and, with balanced routing and no overlap, every GPU waits for the
+slowest:
+
+```
+T_a2a = max( V_nvlink / BW_nvlink(V_nvlink; g) ,  V_net / BW_net(V_net; n_nodes) )
+```
+
+The bandwidths aren't constants:
+- **They depend on message size.** Small messages don't reach peak (latency, NCCL's protocol choice, chunking), and
+  in an A2A each per-peer message is only V/e. At b = 1, t = 4, e = 16 that's about 2 MB.
+- **BW_nvlink depends on g.** Sending to 1 peer (e = 2) uses only the links to that GPU; sending to 3 peers (e ≥ 4)
+  uses the links to all three at once.
+- **BW_net depends on the number of nodes.** With more nodes, more of V leaves the node, and each NIC carries more
+  and smaller flows. Receivers get traffic from more senders at once (incast), the job is more likely to span
+  Slingshot switch groups, and NCCL's all-to-all becomes less efficient with more peers. The same bytes per GPU
+  take longer over 4 nodes than over 2.
+
+**Per layer and micro-batch:**
+
+```
+T_ep,layer = 4 · T_a2a(V)           tokens: dispatch and combine, forward and backward
+           + 2 · T_a2a(V_probs)     router probabilities: a second A2A in dispatch, forward and backward;
+                                    V_probs = T_loc · k · 4 B (131 KB for Qwen3 at b = 1, t = 1), so latency only
+           + T_allgather(E · 8 B, e)  per-expert token counts, forward only; latency only
+```
+
+At e = 1 all three are zero.
+
+**What we measure.** `torch.distributed.all_to_all_single` on a bf16 tensor over the EP group, the call Megatron
+makes (`token_dispatcher.py:708`, `:867`):
+- each GPU sends V split into e equal parts (balanced routing);
+- V is swept from about 1 MB to 1 GB; it's an input we choose, not something we measure;
+- e = 2 and 4 (1 node) give BW_nvlink for g = 2 and g = 4; e = 8 and 16 (2 and 4 nodes) give BW_net for
+  n_nodes = 2 and 4. There the network part dominates (about 6× slower than NVLink), so BW_net = V_net / T. Any
+  slowdown from the NVLink traffic running alongside ends up in that fitted bandwidth, which is fine: it's measured
+  in the layout plans use;
+- the time per call is from CUDA events after warm-up: the median over iterations, of the slowest rank;
+- **whole nodes, all EP groups at once.** In a real job every EP group of a stage does its A2A at the same moment.
+  For e ≥ 4 each node belongs to one group, so the network profiling has to load the nodes the same way, or it misses NIC
+  contention.
+
+Effective bandwidth = bytes / time, the "algbw" of nccl-tests. Each curve is fitted as **time = α + bytes / β**
+(latency plus bytes over bandwidth; `sailor/profiling/networking/fit_alltoall.py`), by least squares on the relative
+time error. Decided 2026-11-10 instead of original Sailor's form (bandwidth quadratic in log2(message size),
+`fit_func.py`): on the measured A2A (job 3901891) the quadratic misses the small router-probabilities A2A by
+53–106% (median), while α + bytes / β stays within 10% from 32 KB to 1 GB. The two numbers are stored per
+configuration, the same lookup pattern as Sailor's `get_zone_coeffs`, with our configuration as the key:
+
+```
+coefficients[nvlink][g]        g = 2, 4          {alpha_s, beta_GBps}
+coefficients[net][n_nodes]     n_nodes = 2, 4
+```
+
+α is measured two ways (`test_alltoall.py`): with the host launch inside the timing window and GPU only. Which one
+training sees depends on whether the CPU runs ahead of the GPU at that call; the training traces decide.
+
+That's four curves. Before using them, check that they make physical sense: NVLink much faster than the network,
+bandwidth rising with size.
+
+**Compared with original Sailor.** Sailor uses the same building block (size-dependent bandwidth curves per link
+and per number of GPUs per node taking part), but it measures only point-to-point sends and *derives* collectives
+from them: its all-reduce is the ring model `2·(n − 1) · t_p2p(size/n)` (`profile_utils.py:estimate_ar_time`). We
+measure the A2A itself. A point-to-point curve measures one pair alone, while an A2A has many simultaneous flows per
+GPU and incast at every receiver, which is exactly what makes it expensive.
+
+**Limit: only measured EP sizes.** The planner may only choose e for which data exist (A2A curves and an expert
+profile), and must reject other e rather than extrapolate. Nothing in the code caps e; the limits come from the
+model and from what we chose to measure:
+- e must divide E (for Qwen3: 1, 2, 4, 8, 16, 32, …), so layouts like e = 12 on 3 nodes don't occur;
+- **our emulation, not the model:** the real model runs at any e that divides E, down to one expert per GPU
+  (Megatron only requires top-k ≤ the *total* E). The `--num-experts E/e` profiles run at EP = 1 with E/e *total*
+  experts, so they need E/e ≥ k (Qwen3: e ≤ 16; Mixtral: e ≤ 4). For smaller E/e, profile at the real EP = e
+  (multi-node if needed): `layer_parts` still separates `experts` from `dispatch` / `combine`;
+- **measurement:** the A2A curves exist only for the node counts we ran. So far we stay within 4 nodes (e ≤ 16) to
+  save compute; larger e needs runs on more nodes, not code changes.
+
+**Biases:** imbalanced routing makes the busiest GPU send and receive more than V. EP rank layouts other than
+consecutive would change g and n_nodes.
 
 #### F5 Expert MLPs: measured, with fewer experts
 
@@ -246,7 +347,8 @@ on shapes fixed by (t, b, s) and the model. The profiler already records them as
   - Each GPU then holds E/e experts and routes its T_loc·k token copies over them: T_loc·k·e/E tokens each. That's
     exactly the grouped GEMM of the real model at EP = e.
   - The TP × MBS sweep varies T_loc. One sweep per E/e covers the tokens-per-expert range: for Qwen3, E/e = 128, 64,
-    32, 16 and 8. The router's top-k = 8 limits E/e to at least 8, so e ≤ 16.
+    32, 16 and 8. This emulation can't go below E/e = k (Qwen3: 8, so e ≤ 16); the real model can. See the limit
+    below.
   - Only the `experts` part of these runs is used. The rest of the model is the same as in the normal profile.
 - **Why the number carries over:**
   - The grouped GEMM's inputs are completely determined by (E/e, n, h, f). Where the tokens came from (which GPU,
@@ -260,19 +362,41 @@ on shapes fixed by (t, b, s) and the model. The profiler already records them as
 
 - **What:** after stage j's forward, each GPU sends its part of the activation (b·s/t × h with sequence
   parallelism) to the matching GPU of stage j + 1. In the backward pass the gradient of the same size goes back.
-- **How:** Sailor's existing P2P model: the profiled `act_output_floats` of the stage's last layer × b × bytes per
-  element, then the network coefficients for that link (`estimate_p2p_pipeline_times`).
-- **Why it carries over:** the tensor size is fixed by (b, s, h, t), and the duration of a point-to-point send
-  depends only on its size and the link. It's unchanged for MoE, because the stage boundary falls between layers,
-  where activations are dense.
+- **What crosses the boundary:** inside a stage, between layers, each of the t TP GPUs holds a different s/t slice of
+  the tokens (full h each), so the activation is complete only across the t GPUs together. Megatron pairs TP rank i
+  of stage j with TP rank i of stage j + 1, and each pair sends its own slice. The receiver needs exactly that slice
+  (its first layer starts with RMSNorm on s/t tokens, then the all-gather before attention), so nothing is gathered
+  at the boundary. In total s·h crosses the boundary, exactly once. Without sequence parallelism every TP GPU would
+  hold the same full copy, which is what original Sailor assumed.
+- **Formula:** the size is fixed by the shapes, so it's calculated, not profiled:
+
+  ```
+  bytes_j = b · s · h / t · 2 B                       per GPU, per micro-batch (bf16)
+  Q_j     = T_send(bytes_j, link j → j+1)           forward: the activation
+          + T_send(bytes_j, link j+1 → j)           backward: its gradient, same size
+  Q_last  = 0
+  ```
+
+  The t GPUs of the stage send in parallel; on Alps each GH200 has its own NIC. `T_send` is Sailor's point-to-point
+  model (`estimate_send_time`, with the coefficients of the link). Example, LLAMA at b = 1, t = 4:
+  8192 · 4096 / 4 = 8.4M elements, 16.8 MB per GPU per direction.
+- **Why it carries over:** the size depends only on (b, s, h, t), and a point-to-point send only on its size and the
+  link. It's unchanged for MoE: at the boundary the tokens are back on their own GPUs (combine has returned them),
+  so no expert-routed data crosses it.
+- **Fix in Sailor:** `runtime_simulator.py:161-175` takes `act_output_floats` from the **TP 1** entry when one exists
+  (the full s·h), whatever the plan's t. With sequence parallelism that overestimates the bytes by t. Use the
+  formula above (or the plan's own t entry). The profiled `act_output_floats` stays useful as a cross-check: it
+  equals s·h/t, and a mismatch would reveal a misunderstood layout.
 
 ### 2.4 Zeroing the gradient buffers: T_zero
 
 - A memset of this GPU's gradient buffer at the start of the iteration. It's proportional to the bytes of
   gradients held (dense / t, experts / e, × 2 bytes) and bandwidth-bound.
-- Small: about 3 GB at 4 TB/s is under 1 ms.
-- **How:** calculate from the bytes and a memory bandwidth measured once, or ignore. It falls outside the
-  profiler's events today; it's part of the 2–5% the profile doesn't cover for LLAMA.
+- Small: about 2 bytes per element held, against roughly 20 for the optimizer step. A Qwen3 stage of 12 layers at
+  EP 8 holds about 1.1B parameters, 2.3 GB, so about 0.6 ms at roughly 4 TB/s, under 0.1% of an iteration of
+  seconds.
+- **Ignored** in the formula. If it ever matters, it's proportional to n like the step, so it can be absorbed into
+  r (section 4). It falls outside the profiler's events; it's part of the few % the profile doesn't cover.
 
 ## 3. Gradient synchronisation: T_grad_sync, calculated
 
@@ -293,7 +417,7 @@ everything it holds.
 - Small computation inside this phase:
   - The additions of the all-reduce run inside NCCL's kernels. A collective benchmark in bf16 includes them.
   - Before the all-reduce, Megatron scales the gradients by 1/d (1/EDP for experts) to get a mean. That's one
-    elementwise pass over the gradient buffer, under 1 ms, so it's calculated or ignored like T_zero.
+    elementwise pass over the gradient buffer, under 1 ms, so it's ignored like T_zero.
 
 ```
 T_grad_sync = max over stages j of [ AR(dense bytes_j, d, layout) + AR(expert bytes_j, EDP, layout) + AR_small(t) ]
@@ -318,7 +442,9 @@ T_grad_sync = max over stages j of [ AR(dense bytes_j, d, layout) + AR(expert by
    - Use the **intra-node** network coefficients when the group fits in one node. Today it always uses the
      inter-node coefficients with `gpu_count = 1`.
    - Remove the cap of 4 on `tp_min`.
-   - Use **Megatron's gradient bucket size**, not DeepSpeed's `MEMORY_BUCKET_DEEPSPEED_SIZE`.
+   - Use **Megatron's gradient bucketing**, not DeepSpeed's `MEMORY_BUCKET_DEEPSPEED_SIZE`. Without
+     `--overlap-grad-reduce` Megatron doesn't bucket at all (`distributed_data_parallel.py:135-137` sets
+     `bucket_size = None`): one all-reduce per gradient buffer, dense and experts.
 
 ## 4. Optimizer step: T_step, measured as a rate, then scaled
 
@@ -358,7 +484,10 @@ T_step,j = r · n_j + c
 written / memory bandwidth + fixed launch cost, so it's linear in n, wherever the parameters came from.
 
 **Cautions:**
-- The Qwen3 profiles so far (job 3884919) ran **with** the distributed optimizer. Their `update` is from a sharded
+- First ZeRO-0 tests (jobs 3895459, 3895460, 3895513, 3896090; MBS 1): 19–22 ps per element across Qwen3 TP 1 and
+  2, Qwen3 with 16 experts and LLAMA TP 2, so the step is linear in n. With ZeRO-0 the odd TP 1 → TP 2 result is
+  gone (38.9 → 33.3 ms, in line with 1.87 → 1.54B elements).
+- The Qwen3 profiles before that (job 3884919) ran **with** the distributed optimizer. Their `update` is from a sharded
   step, with the experts sharded over EDP = t. That probably includes the parameter all-gather, and explains the
   odd TP 1 → 2 update times (46 → 44 ms). They have to be re-profiled with ZeRO-0 before fitting r and c. The same
   applies to the LLAMA profiles (job 3884918); there the sharding has no effect at DP = 1, but the code path
@@ -371,13 +500,12 @@ written / memory bandwidth + fixed launch cost, so it's linear in n, wherever th
 ## 5. Full formula and who uses it
 
 ```
-T_iter = T_zero
-       + Σ_j (C_j + Q_j) + (m − 1) · max_j (C_j + Q_j)
+T_iter = Σ_j (C_j + Q_j) + (m − 1) · max_j (C_j + Q_j)
        + max_j [ AR_DP,j + AR_EDP,j + AR_TP,j ]
        + max_j [ r · n_j + c ]
 
 C_j = Σ over the layers of stage j of
-        [ F1(t,b) + F2,3,7(t,b) + F5(E/e, T_loc·k·e/E)  +  4 · A2A(T_loc·k·h·2B, e, layout) ]   (forward + backward)
+        [ F1(t,b) + F2,3,S1,S2,7(t,b) + F5(E/e, T_loc·k·e/E) + T_ep,layer(V, e) ]                  (forward + backward)
       + E1 on the first stage, H1–H3 on the last stage                                         (forward + backward)
 ```
 
@@ -385,7 +513,8 @@ C_j = Σ over the layers of stage j of
   `runtime_simulator.py`, whose `T_pp + T_sync` structure it keeps.
 - **Planner:** search over plans for the minimum T_iter (or Sailor's cost objective) subject to the memory limit
   (16 bytes per parameter held, plus activations and the fixed overhead). It uses the same formula in C++.
-  - New search dimension: **e**, with the constraints e | t·d and e | E.
+  - New search dimension: **e**, with the constraints e | t·d, e | E, and e among the EP sizes with measured A2A
+    curves and expert profiles (Qwen3 today: up to 16).
   - e changes four things: F5 (shapes), the A2A (bytes stay the same, but group size and layout change), the EDP
     all-reduce, and the step's expert elements (P_exp / e). It doesn't change F1–F3, F7 or P2P.
   - That makes the search cheap: for each (t, b), the dense part is a single lookup, and only the expert terms are
@@ -396,17 +525,17 @@ C_j = Σ over the layers of stage j of
 | Term | Measured / calculated | Source | Depends only on |
 |---|---|---|---|
 | F1 attention, E1 embedding, H1–H3 final norm / output layer / loss | measured | profiler, 1 node, per (t, b) | t, b, model |
-| F2/F3/F7 router, permute, unpermute | measured | profiler at EP = 1, hooks on router/dispatcher | t, b, model |
-| F5 expert MLPs | measured | grouped-GEMM benchmark over (E/e, tokens per expert) | E/e, n, h, f |
-| F4/F6 A2A ×4 | calculated | A2A cost model (NCCL benchmark per e and layout) | bytes, e, nodes spanned |
-| Q P2P between stages | calculated | Sailor's P2P model | b, s, h, t, link |
-| T_zero, gradient scaling | calculated or ignored | memory bandwidth | gradient bytes |
+| F2/F3/S1/S2/F7 router, permute, sorts, unpermute | measured | profiler at EP = 1, hooks on router/dispatcher | t, b, model |
+| F5 expert MLPs | measured | profiler `experts` part with `--num-experts E/e`, at EP = 1 | E/e, n, h, f |
+| F4/F6 A2A ×4, probabilities ×2, count all-gather | calculated | bandwidth curves: NVLink per g, network per n_nodes | bytes, g, n_nodes |
+| Q P2P between stages | calculated | b·s·h/t·2 B with Sailor's point-to-point model | b, s, h, t, link |
+| T_zero, gradient scaling | ignored | negligible | gradient bytes |
 | Gradient all-reduce | calculated | collective model | bytes, d / EDP, layout |
 | Optimizer step | measured r, c × elements | line fit through profiled `update` against n | n |
 
 ## 7. Profiler: what it does now, what it needs
 
-**Now** (`sailor/profiling/mcore/`):
+**Now** (`sailor/mcore/`: `models.py` shared, `profiler/`, `validation/`; models in `Planner/simulations/configs/`):
 - `profile_mcore.py` writes per layer forward / backward / `update` times and the memory fields Sailor reads, for
   one (t, b) per run.
 - It also writes a `gpu_memory` block: non-PyTorch overhead after setup and at the end, and peak allocated /
@@ -429,15 +558,17 @@ C_j = Σ over the layers of stage j of
 
 1. **Re-profile with ZeRO-0** (1 node, about 10 minutes per sweep): both models, plus one Qwen3 sweep for each
    `--num-experts` of 64, 32, 16 and 8.
-2. **A2A cost model (F4/F6)**: reuse the moe-comms NCCL A2A measurements, or measure curves for e = 2, 4 (1 node),
-   8, 16 (2–4 nodes).
-3. **Simulator**: implement the formula and the three `estimate_sync_time` fixes; validate against measured
+2. **A2A bandwidth curves (F4/F6)**: the network profiling in section 2.2 (F4/F6), `sailor/profiling/networking/test_alltoall.py`, at e = 2, 4 (1 node), 8 and 16 (2 and 4
+   nodes, whole nodes). Check first whether moe-comms' NCCL A2A measurements already cover these points with
+   full-node loading.
+3. **Simulator**: implement the formula, the three `estimate_sync_time` fixes and the P2P fix (section 2.3);
+   validate against measured
    end-to-end iteration times of real runs (1–4 nodes, several (t, d, e)).
 4. **Planner**: the same formula in C++, plus the search over e and the memory model.
-5. **Things to confirm in nsys traces**:
-   - no TP gather in the MoE block with ETP = 1;
-   - the GPU-to-CPU synchronisation in dispatch;
-   - the EP rank layout (consecutive ranks, filling a node first).
+5. **Things to confirm**:
+   - the EP rank layout (consecutive ranks, filling a node first), in Megatron's process-group code;
+   - in an nsys trace, the small backward times of some parts (`unpermute` 0.05 ms against 0.49 ms forward,
+     `combine` 2 µs at EP = 1), before relying on them.
 
 **Known biases of this model**, to keep in mind when validating:
 - balanced routing (optimistic);

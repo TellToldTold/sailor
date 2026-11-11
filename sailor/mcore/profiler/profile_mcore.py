@@ -29,12 +29,16 @@ import runpy
 import sys
 from pathlib import Path
 
-import torch
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # mcore/: megatron_hooks.py
+import megatron_hooks  # noqa: E402
+
+CPU_BIND = megatron_hooks.bind_cpus_to_gpu()  # before torch: its threads inherit the binding
+
+import torch  # noqa: E402
 
 # our copy of Megatron must come first on the path, before any megatron import
 MEGATRON = Path(__file__).resolve().parents[3] / "third_party" / "Megatron-LM"
 sys.path.insert(0, str(MEGATRON))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # mcore/: megatron_hooks.py
 
 import megatron.core  # noqa: E402
 import megatron.core.pipeline_parallel.schedules as schedules  # noqa: E402
@@ -318,14 +322,15 @@ def main():
                 f"profile_{sailor.sailor_model_name}_{sailor.sailor_gpu_type}_"
                 f"{margs.tensor_model_parallel_size}_{margs.micro_batch_size}.json")
             
+            res["cpu_bind"] = CPU_BIND  # rank 0's CPU binding (megatron_hooks.bind_cpus_to_gpu)
             path.write_text(json.dumps(res, indent=2))
             print(f"[sailor-profile] wrote {path}", flush=True)
         
         return out
 
     if "--nvtx-ranges" in megatron_argv:  # traced runs: NVTX names without inspect (megatron_hooks)
-        import megatron_hooks
         megatron_hooks.fast_nvtx_names()
+    print(f"[sailor-profile] rank {os.environ.get('RANK', '0')} CPU binding: {CPU_BIND}", flush=True)
 
     if os.environ.get("RANK", "0") == "0":
         print(f"[sailor-profile] megatron from {Path(megatron.core.__file__).parent}", flush=True)

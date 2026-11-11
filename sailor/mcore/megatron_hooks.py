@@ -5,6 +5,9 @@ fast_nvtx_names: with --nvtx-ranges, Megatron names every NVTX range after its c
 inspect.getframeinfo / getmodule (~0.1 ms each, twice per range): CPU time that is not in an untraced run. Same names,
 read directly from the caller's frame.
 
+bind_cpus_to_gpu: pins the process to the CPUs of its GPU's NUMA node, as training launched with srun (one task per
+GPU, bound) runs. Not from moe-comms.
+
 count_routing: per MoE layer call, the router's token-expert pairs per destination GPU / node of the EP group, counted
 on the GPU without host syncs, written to <out_dir>/<NAME>_rank<RANK>_routing.npz (moetrace: routing.parquet and the
 alltoall bytes check).
@@ -12,6 +15,27 @@ alltoall bytes check).
 
 import os
 import sys
+
+
+def bind_cpus_to_gpu():
+    """Pin this process to the CPUs of its GPU's NUMA node (GH200: GPU LOCAL_RANK <-> NUMA node LOCAL_RANK, 72 cores),
+    within the CPUs it may use (Slurm's cpuset). Call before importing torch, so its threads inherit it.
+    SAILOR_CPU_BIND=0 leaves the process unbound (OS placement). Returns a description for logs and profiles."""
+    if os.environ.get("SAILOR_CPU_BIND", "1") == "0":
+        return "unbound (SAILOR_CPU_BIND=0)"
+    node = int(os.environ.get("LOCAL_RANK", "0"))
+    path = f"/sys/devices/system/node/node{node}/cpulist"
+    if not os.path.exists(path):
+        return f"unbound (no {path})"
+    cpus = set()
+    for part in open(path).read().strip().split(","):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    allowed = cpus & os.sched_getaffinity(0)
+    if not allowed:
+        return f"unbound (NUMA node {node} outside this process' CPUs)"
+    os.sched_setaffinity(0, allowed)
+    return f"NUMA node {node}, CPUs {min(allowed)}-{max(allowed)} ({len(allowed)})"
 
 
 def fast_nvtx_names():

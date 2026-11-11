@@ -180,7 +180,7 @@ python -m moetrace view $SCRATCH/sailor-profiles/LLAMA-3-8/<job>/traces/tables -
 ```
 
 Layout of `sailor/mcore/` (Megatron-Core runs on Alps): `models.py` (the models' training configs as Megatron
-arguments, shared settings, environment, nsys command), `megatron_hooks.py` (fast NVTX names, routing counts), `alps6.toml` (container), `profiler/` (per-layer
+arguments, shared settings, environment, nsys command), `megatron_hooks.py` (fast NVTX names, routing counts, CPU binding: every rank of a profile or validation run is pinned to its GPU's NUMA node, as srun-launched training; `SAILOR_CPU_BIND=0` leaves it unbound), `alps6.toml` (container), `profiler/` (per-layer
 profiles: `profile_mcore.py`, `profile_sweep.py`, `profile_sweep.slurm`), `validation/` (training runs of one plan:
 `validation_run.py`, `validation_run.slurm`, per-rank `train_mcore.py`).
 
